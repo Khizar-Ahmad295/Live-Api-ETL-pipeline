@@ -1,0 +1,40 @@
+# Revenue by Category
+category,total_revenue
+fragrances,241174.42
+beauty,150590.19
+electronics,113342.92
+furniture,99948.72
+groceries,54122.04
+
+# Top 5 Customers by Spend
+customer_id,name,email,total_spend
+214,Rebecca Campbell,manningamy@example.net,10783.62
+128,Karen Alvarado,jhernandez@example.net,10681.74
+140,Sean Tucker,aeaton@example.net,9029.26
+224,Justin Maxwell,breanna67@example.net,8480.2
+287,Kristen Wilson,wsampson@example.com,8344.54
+
+# Orders by Status
+status,order_count,status_group
+shipped,101,In Transit
+cancelled,91,Not Completed
+processing,91,In Progress
+pending,86,In Progress
+delivered,83,Completed
+
+# Month-over-Month Revenue
+month,revenue,previous_month_revenue,revenue_change
+2025-07-31 19:00:00+00:00,24100.71,,
+2025-08-31 19:00:00+00:00,48450.26,24100.71,24349.55
+2025-09-30 19:00:00+00:00,50116.01,48450.26,1665.75
+2025-10-31 19:00:00+00:00,58710.92,50116.01,8594.91
+2025-11-30 19:00:00+00:00,54494.8,58710.92,-4216.12
+2025-12-31 19:00:00+00:00,60643.92,54494.8,6149.11
+2026-01-31 19:00:00+00:00,53041.44,60643.92,-7602.48
+2026-02-28 19:00:00+00:00,76278.34,53041.44,23236.9
+2026-03-31 19:00:00+00:00,65576.7,76278.34,-10701.64
+2026-04-30 19:00:00+00:00,52392.05,65576.7,-13184.65
+2026-05-31 19:00:00+00:00,50763.37,52392.05,-1628.68
+2026-06-30 19:00:00+00:00,48594.35,50763.37,-2169.02
+2026-07-31 19:00:00+00:00,16015.42,48594.35,-32578.93
+

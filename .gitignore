@@ -13,8 +13,7 @@ env/
 # IDE
 .vscode/
 
-# Generated CSV files
-*.csv
+
 
 # Python distribution files
 *.egg-info/
