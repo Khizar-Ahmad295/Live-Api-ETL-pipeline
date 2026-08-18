@@ -1,0 +1,5 @@
+pandas==2.3.2
+Faker==37.6.0
+python-dotenv==1.1.1
+SQLAlchemy==2.0.43
+psycopg2-binary==2.9.10

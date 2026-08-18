@@ -1,323 +1,607 @@
+import json
 import os
 import pandas as pd
+
 from dotenv import load_dotenv
-from sqlalchemy import create_engine,text
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import create_engine, text, MetaData, Table, insert
+from urllib.parse import quote_plus
+from pathlib import Path
 
-#Creating connection with postgresql
+# Creating database connection here
+BASE_DIR = Path(__file__).resolve().parent.parent
+SCRIPT_DIR = Path(__file__).resolve().parent  
+load_dotenv(BASE_DIR / ".env")
 
-load_dotenv()
+password = quote_plus(os.getenv("DB_PASSWORD"))
 
-Database_URL=(f"postgresql+psycopg2://{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}" f"@{os.getenv("DB_HOST")}:{os.getenv('DB_PORT')/{os.getenv('DB_NAME')}}")
+DATABASE_URL = (
+    f"postgresql+psycopg2://{os.getenv('DB_USER')}:{password}@"
+    f"{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}"
+)
 
-#sqlconnection created
-engine=create_engine(Database_URL,poolsize=5,max_overflow=2)
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=5,
+    max_overflow=2
+)
 
-rejected_rows=[] #every rejected row stored here
+# Holds reflected Table objects so we only ask Postgres to describe each table once, instead of on every load_data() call.
+metadata = MetaData()
 
-ALLOWED_ORDER_STATUS = {"pending", "processing", "shipped", "delivered", "cancelled"}
-ALLOWED_PAYMENT_METHOD = {"cash", "card", "bank_transfer", "online"}
+ALLOWED_ORDER_STATUS = {
+    "pending",
+    "processing",
+    "shipped",
+    "delivered",
+    "cancelled"
+}
 
-# adding rejected rows to the list
-def rejected(df_row,source_table,reason):
-    row=df_row.to_dict()
-    row["souce_table"]=source_table
-    row["rejection_reason"]=reason
-    rejected_rows.append(row)
+ALLOWED_PAYMENT_METHOD = {
+    "cash",
+    "card",
+    "bank_transfer",
+    "online"
+}
 
-# method for loading data in database POSTgres and returning a dict mapping
+rejected_rows = []
 
-def load_and_map(clean_df,table_name,src_id_col,load_cols,dtype=None):
-    if clean_df.empty:
-        print(f" -> nothing valid to load into {table_name}")
+# Append rejected row in list to create the csv at the end
+def reject_row(row, table_name, reason):
+
+    rejected = row.to_dict()
+
+    rejected["source_table"] = table_name
+    rejected["rejection_reason"] = reason
+
+    rejected_rows.append(rejected)
+
+# get ids of csv rows from database already inserted before in database so same product or customer didnot get inserted twice
+def get_existing_ids_by_column(table_name, column_name, values):
+
+    """
+    Returns:
+
+        {column_value: database_id}
+
+    Example:
+
+        {
+            "john@gmail.com": 31,
+            "ali@gmail.com": 32
+        }
+
+    """
+
+    values = list(values)
+
+    if not values:
         return {}
-    with engine.connect() as conn:
-        result=conn.excecute(text(f"SELECT COALESCE(MAX(id),0) FROM {table_name}"))
-        start_id=result.scalar()
-    to_insert=clean_df[load_cols]
-    to_insert.to_sql(table_name,engine,if_exists="append",index=False,dtype=dtype)
-    
-    new_ids=range(start_id+1,start_id+1+len(clean_df))
-    id_map=dict(zip(clean_df[src_id_col],new_ids))
 
-    print(f" -> loaded {len(clean_df)} rows into {table_name}")
+    with engine.connect() as connection:
+
+        result = connection.execute(
+            text(
+                f"SELECT {column_name}, id "
+                f"FROM {table_name} "
+                f"WHERE {column_name} = ANY(:values)"
+            ),
+            {"values": values}
+        )
+
+        return {
+            row[0]: row[1]
+            for row in result
+        }
+
+# load data in the database and also perform id mapping
+
+def load_data(data,table_name,raw_id_column,columns,json_columns=None):
     
+    if data.empty:
+        print(f"  -> No valid rows to load into {table_name}")
+        return {}
+
+    # Only send actual database columns to PostgreSQL
+    data_to_load = data[columns].copy()
+
+    # JSONB columns need real Python dicts, not JSON-as-text strings.
+    # If the CSV loaded them as strings, decode them here first.
+    if json_columns:
+
+        for col in json_columns:
+
+            data_to_load[col] = data_to_load[col].apply(lambda v: json.loads(v) if isinstance(v, str) else v)
+    # Reflect the table once (SQLAlchemy caches by name in `metadata`)
+    if table_name in metadata.tables:
+        table = metadata.tables[table_name]
+    else:
+        table = Table(table_name, metadata, autoload_with=engine)
+
+    records = data_to_load.to_dict("records")
+
+    with engine.begin() as connection:
+
+        result = connection.execute(
+            insert(table).returning(table.c.id),
+            records
+        )
+
+        # Rows come back in the same order they were sent in
+        new_ids = [row.id for row in result]
+
+    id_map = dict(zip(data[raw_id_column],new_ids))
+    print(f"  -> Loaded {len(data)} rows into {table_name}")
     return id_map
-    
-# Creating the Customer inserting method
 
+
+# load the customer data from the csv and send load data to load the data in the database 
 def process_customers():
-    print("Processing customers_raw.csv ...")
-    df=pd.read_csv("customers_raw.csv")
-    before=len(df)
-    
-    dupes=df[df.duplicated(keep="first")]
-    
-    for _,row in dupes.iterrows():
-        rejected(row,"customers","exact duplicate row")
-        
-    df=df.drop_duplicates(keep="first")
-    # check for valid_rows and adding set to check for email already exist in csv or not for knowing duplicated email
-    valid_rows=[]
-    seen_emails=set()
-    
-    for _,row in df.iterrows():
-        name=str(row["name"]).strip() if pd.notna(row["name"]) else ""
-        email=str(row["email"]).strip() if pd.notna(row["email"]) else ""
-        
-        if not name:
-            rejected(row,"customers","missing required field: name")
-            continue
-        
-        if not email:
-            rejected(row,"customers","missing required field: email")
-            continue
-        
-        if "@" not in email:
-            rejected(row,"customers","invalid email format")
-            continue
-        if email in seen_emails:
-            rejected(row,"customers","duplicate email (violates UNIQUE constraint)")
-            continue
-        
-        phone=str(row["phone"]) if pd.notna(row["phone"]) else""
-        if len(phone)>20:
-            rejected(row,"customers",f"phone exceeds VARCHAR(20) limit: '{phone}'")
-            continue
-        
-        seen_emails.add(email)
-        valid_rows.append(row)
-        
-    clean=pd.DataFrame(valid_rows)
-    
-    id_map=load_and_map(clean,"customers",src_id_col="customer_id",
-                            load_cols=["name","email","phone","address","created_at"],
-                            dtype={"address":JSONB})
-    
-    print(f" customers:{len(clean)} valid/{before} total")
-    
-    return id_map
-# method for loading products and clean the data for sending to load and map process
-def process_products():
-    print("Processing products_raw.csv ...")
-    df = pd.read_csv("products_raw.csv")
-    before = len(df)
+
+    print("Processing customers_raw.csv...")
+
+    df = pd.read_csv(SCRIPT_DIR / "customers_raw.csv")
+
+    total_rows = len(df)
+
+    # Exact duplicate rows
+    duplicate_rows = df[df.duplicated(keep="first")]
+    for _, row in duplicate_rows.iterrows():
+
+        reject_row(row,"customers","exact duplicate row")
+
+    df = df.drop_duplicates(keep="first")
+
+    # Existing customers based on email
+    existing_by_email = get_existing_ids_by_column("customers","email",df["email"].dropna().astype(str).str.strip().str.lower().unique())
 
     valid_rows = []
+
+    seen_emails = set()
+
+    # RAW CSV id -> DATABASE id
+    customer_id_map = {}
+
+    already_loaded_count = 0
+
     for _, row in df.iterrows():
-        title = str(row["title"]).strip() if pd.notna(row["title"]) else ""
+
+        # IMPORTANT:
+        # Fake data generator uses "id", not "customer_id"
+        raw_customer_id = row["id"]
+
+        name = (
+            str(row["name"]).strip()
+            if pd.notna(row["name"])
+            else ""
+        )
+
+        email = (
+            str(row["email"]).strip().lower()
+            if pd.notna(row["email"])
+            else ""
+        )
+
+        if not name:
+
+            reject_row(row,"customers","missing required field: name"
+            )
+            continue
+
+        if not email:
+
+            reject_row(row,"customers","missing required field: email")
+
+            continue
+
+        if "@" not in email:
+
+            reject_row(row,"customers","invalid email format")
+
+            continue
+
+        # Customer already exists
+        if email in existing_by_email:
+
+            customer_id_map[raw_customer_id] = existing_by_email[email]
+
+            already_loaded_count += 1
+
+            continue
+
+        # Duplicate email inside this CSV
+        if email in seen_emails:
+
+            reject_row(row,"customers","duplicate email ""(violates UNIQUE constraint)")
+
+            continue
+
+        phone = (
+            str(row["phone"])
+            if pd.notna(row["phone"])
+            else ""
+        )
+
+        if len(phone) > 20:
+
+            reject_row(row,"customers",f"phone exceeds VARCHAR(20) limit: '{phone}'")
+
+            continue
+
+        seen_emails.add(email)
+
+        row = row.copy()
+        row["email"] = email
+
+        valid_rows.append(row)
+
+    clean = pd.DataFrame(valid_rows)
+
+    new_id_map = load_data(clean,"customers",raw_id_column="id",
+        columns=[
+            "name",
+            "email",
+            "phone",
+            "address",
+            "created_at"
+        ],
+
+        json_columns=["address"]
+    )
+
+    customer_id_map.update(
+        new_id_map
+    )
+
+    print(
+        f"  customers: {len(clean)} newly inserted, "
+        f"{already_loaded_count} already existed, "
+        f"{total_rows} total in file"
+    )
+
+    return customer_id_map
+
+ # load the customer data from the csv and send load data to load the data in the database 
+
+# load the products data from the csv and send load data to load the data in the database 
+def process_products():
+
+    print("Processing products_raw.csv...")
+
+    df = pd.read_csv(SCRIPT_DIR / "products_raw.csv")
+
+    total_rows = len(df)
+
+    # Existing products based on title
+    existing_by_title = get_existing_ids_by_column("products","title",df["title"].dropna().unique())
+
+    valid_rows = []
+
+    # RAW CSV id -> DATABASE id
+    product_id_map = {}
+
+    already_loaded_count = 0
+
+    for _, row in df.iterrows():
+
+        # IMPORTANT:
+        # Fake data generator uses "id"
+        raw_product_id = row["id"]
+
+        title = (
+            str(row["title"]).strip()
+            if pd.notna(row["title"])
+            else ""
+        )
+
         if not title:
-            rejected(row, "products", "missing required field: title")
+
+            reject_row(row,"products","missing required field: title")
+
+            continue
+
+        # Product already exists
+        if title in existing_by_title:
+
+            product_id_map[raw_product_id] = existing_by_title[title]
+
+            already_loaded_count += 1
+
             continue
 
         if pd.isna(row["price"]):
-           
-            rejected(row, "products", f"price missing or non-numeric (raw: '{row['price']}')")
+
+            reject_row(row,"products",f"price missing or non-numeric (raw: '{row['price']}')")
+
             continue
+
         price = float(row["price"])
+
         if price < 0:
-            rejected(row, "products", "negative price violates CHECK constraint")
+
+            reject_row(row,"products","negative price violates CHECK constraint")
+
             continue
 
         row = row.copy()
+
         row["price"] = price
+
         valid_rows.append(row)
 
     clean = pd.DataFrame(valid_rows)
+
     if not clean.empty:
+
         clean["brand"] = clean["brand"].replace("", None)
+
         clean["availability_status"] = clean["stock_quantity"].apply(
-            lambda q: "Low Stock" if pd.notna(q) and q < 10 else "In Stock"
+            lambda quantity:
+                "Low Stock"
+                if pd.notna(quantity)
+                and quantity < 10
+                else "In Stock"
         )
 
-    id_map = load_and_map(
-        clean, "products", src_id_col="product_id",
-        load_cols=["title", "description", "category", "brand", "price",
-                   "discount_percentage", "stock_quantity", "rating",
-                   "availability_status", "minimum_order_quantity", "created_at"],
+    new_id_map = load_data(clean,"products",raw_id_column="id",
+        columns=[
+            "title",
+            "description",
+            "category",
+            "brand",
+            "price",
+            "discount_percentage",
+            "stock_quantity",
+            "rating",
+            "availability_status",
+            "minimum_order_quantity",
+            "created_at"
+        ]
     )
-    print(f"  products: {len(clean)} valid / {before} total")
-    return id_map
+
+    product_id_map.update(new_id_map)
+
+    print(
+        f"  products: {len(clean)} newly inserted, "
+        f"{already_loaded_count} already existed, "
+        f"{total_rows} total in file"
+    )
+
+    return product_id_map
 
 
-
-# method for loading orders and clean the data for sending to load and map process
-
+# load the orders data from the csv and send load data to load the data in the database 
 def process_orders(customer_id_map):
-    print("Processing orders_raw.csv")
-    
-    df=pd.read_csv("orders_raw.csv")
-    
-    before=len(df)
-    
-    valid_rows=[]
-    
-    for _,row in df.iterrows():
-        raw_cust_id=row["customer_id"]
-        if pd.isna(raw_cust_id) or str(raw_cust_id).strip()=="":
-            rejected(row,"orders","missing required field: customer_id")
-    
-        try:
-            raw_cust_id=int(raw_cust_id)
-        except (ValueError,TypeError):
-            rejected(row,"orders",f"customer_id not numeric: '{raw_cust_id}'")
-            continue
-        
-        status=str(row["status"]).strip().lower()
-        
-        if status not in ALLOWED_ORDER_STATUS:
-            rejected(row,"orders",f"invalid status value: '{status}'")
-            continue
-        
-        db_cust_id=customer_id_map.get(raw_cust_id)
-        if db_cust_id is None:
-            rejected(row,"orders",f"customer_id {raw_cust_id} does not exist or was rejected (orphan FK)")
-            continue
-        
-        row=row.copy()
-        row["customer_id"]=db_cust_id
-        row["status"]=status
-        row["total_amount"]=0.0 #placeholder updated after loading the other orderitems data
-        valid_rows.append(row)
-        
-        clean=pd.DataFrame(valid_rows)
-        id_map=load_and_map(
-            clean,"orders",src_id_col="order_id",
-            load_cols=["customer_id","order_date","status","total_amount"],
-            
-        )
-        print(f"orders:{len(clean)} valid/{before} total")
-        return id_map
-    
-# method for loading order_items and clean the data for sending to load and map process
-
-def process_order_items(order_id_map,product_id_map):
-    print("Processing order_items_raw.csv...")
-    df=pd.read_csv("order_items_raw.csv")
-    
-    before=len(df)
-    
-    valid_rows=[]
-    
-    for _,row in df.iterrows():
-        try:
-            qty=int(row["quantity"])
-        except (ValueError,TypeError):
-            rejected(row,"order_items",f"quantity not an integer: '{row['quantity']}'")
-            continue
-        
-        if qty<=0:
-            rejected(row,"order_items",f"quantity must be > 0 (CHECK constraint)")
-            continue
-        
-        raw_order_id=row["order_id"]
-        raw_product_id=row["product_id"]
-        
-        db_order_id=order_id_map.get(int(raw_order_id)) if pd.notna(raw_order_id) else None
-        
-        db_product_id=product_id_map.get(int(raw_product_id)) if pd.notna(raw_product_id) else None
-        
-        if db_order_id is None:
-            rejected(row, "order_items", f"order_id {raw_order_id} does not exist or was rejected (orphan FK)")
-            continue
-        if db_product_id is None:
-            rejected(row, "order_items", f"product_id {raw_product_id} does not exist or was rejected (orphan FK)")
-            continue
-        
-        row=row.copy()
-        row["quantity"]=qty
-        row["order_id"]=db_order_id
-        row["product_id"]=db_product_id
-        valid_rows.append(row)
-        
-        clean=pd.DataFrame(valid_rows)
-        
-        load_and_map(clean,"order_items",src_id_col="item_id",load_cols=["order_id","product_id","quantity","unit_price","discount_percentage"],)
-        
-        if not clean.empty:
-            # oder_items are loaded with 0.0 total_amount placeholder on 
-            # orders - so now we will recompute the real toatl from the line items now.
-            
-            with engine.begin() as conn:
-                conn.execute(text("""
-                    UPDATE orders o
-                    SET total_amount = sub.total
-                    FROM (
-                        SELECT order_id,
-                            ROUND(SUM(quantity * unit_price * (1 - discount_percentage / 100.0)), 2) AS total
-                        FROM order_items
-                        GROUP BY order_id
-                    ) sub
-                    WHERE o.id = sub.order_id
-                """))
-        print("  -> recalculated orders.total_amount from order_items")
- 
-    print(f"  order_items: {len(clean)} valid / {before} total")
- 
-# method for loading payments.csv and clean the data for sending to load and map process this method also need order table id map
-
-def process_payments(order_id_map):
-    print("Processing payments_raw.csv ...")
-    df = pd.read_csv("payments_raw.csv")
-    before = len(df)
- 
-    seen = set()
+    print("Processing orders_raw.csv...")
+    df = pd.read_csv(SCRIPT_DIR / "orders_raw.csv")
+    total_rows = len(df)
     valid_rows = []
     for _, row in df.iterrows():
-        key = (row["order_id"], row["amount"], row["method"])
-        if key in seen:
-            rejected(row, "payments", "duplicate payment row")
+        raw_order_id = row["id"]
+
+        raw_customer_id = row["customer_id"]
+
+        if (pd.isna(raw_customer_id)or str(raw_customer_id).strip() == ""):
+            reject_row(row,"orders","missing required field: customer_id")
+
             continue
- 
+
+        try:
+
+            raw_customer_id = int(raw_customer_id)
+
+        except (ValueError, TypeError):
+
+            reject_row(row,"orders",f"customer_id not numeric:'{raw_customer_id}'")
+            continue
+
+        status = (str(row["status"]).strip().lower())
+        if status not in ALLOWED_ORDER_STATUS:
+            reject_row(row,"orders",f"invalid status value: '{status}'")
+            continue
+
+        # Convert raw customer ID
+        # to PostgreSQL customer ID
+        database_customer_id = (customer_id_map.get(raw_customer_id))
+
+        if database_customer_id is None:
+
+            reject_row(row,"orders",f"customer_id {raw_customer_id} does not exist or was rejected (orphan FK)")
+
+            continue
+
+        row = row.copy()
+
+        row["customer_id"] = (
+            database_customer_id
+        )
+
+        row["status"] = status
+
+        # Recalculated later from order_items
+        row["total_amount"] = 0.0
+
+        valid_rows.append(row)
+
+    clean = pd.DataFrame(valid_rows)
+
+    order_id_map = load_data(clean,"orders",
+        raw_id_column="id",
+        # PostgreSQL columns
+        columns=["customer_id","order_date","status","total_amount"]
+    )
+
+    print(f"  orders: {len(clean)} valid /{total_rows} total")
+
+    return order_id_map
+
+
+# load the order_items data from the csv and send load data to load the data in the database 
+def process_order_items(order_id_map,product_id_map):
+    print("Processing order_items_raw.csv...")
+    df = pd.read_csv(SCRIPT_DIR / "order_items_raw.csv")
+    total_rows = len(df)
+    valid_rows = []
+    for _, row in df.iterrows():
+
+        # IMPORTANT:
+        # Raw order_items CSV uses "id"
+        raw_item_id = row["id"]
+
+        try:
+            quantity = int(row["quantity"])
+        except (ValueError, TypeError):
+            reject_row(row,"order_items",f"quantity not an integer: '{row['quantity']}'")
+
+            continue
+
+        if quantity <= 0:
+
+            reject_row(row,"order_items","quantity must be > 0  (CHECK constraint)")
+
+            continue
+
+        raw_order_id = row["order_id"]
+
+        raw_product_id = row["product_id"]
+
+        try:
+
+            database_order_id = (order_id_map.get(int(raw_order_id)) if pd.notna(raw_order_id) else None)
+
+            database_product_id = (product_id_map.get(int(raw_product_id))if pd.notna(raw_product_id)else None)
+
+        except (ValueError, TypeError):
+
+            reject_row(row,"order_items", "order_id or product_id is not numeric")
+
+            continue
+
+        if database_order_id is None:
+
+            reject_row(row,"order_items",f"order_id {raw_order_id} does not exist or was rejected (orphan FK)")
+
+            continue
+
+        if database_product_id is None:
+
+            reject_row(row,"order_items",f"product_id {raw_product_id} does not exist or was rejected (orphan FK)"
+            )
+
+            continue
+
+        row = row.copy()
+
+        row["quantity"] = quantity
+
+        row["order_id"] = (database_order_id)
+
+        row["product_id"] = (database_product_id)
+
+        valid_rows.append(row)
+
+    clean = pd.DataFrame(valid_rows)
+
+    load_data(clean,"order_items",raw_id_column="id",
+        # PostgreSQL columns
+        columns=[
+            "order_id",
+            "product_id",
+            "quantity",
+            "unit_price",
+            "discount_percentage"
+        ]
+    )
+
+    # Recalculate order totals
+    if not clean.empty:
+        with engine.begin() as connection:
+            connection.execute(
+                text("""UPDATE orders AS orders_table
+                        SET total_amount = totals.total
+                    FROM (SELECT order_id,ROUND(SUM(quantity* unit_price* (1- discount_percentage/ 100.0)),2) AS total
+                          FROM order_items
+                          GROUP BY order_id) AS totals
+                          WHERE orders_table.id = totals.order_id"""))
+        print("  -> Recalculated orders.total_amount from order_items")
+    print(f"  order_items: {len(clean)} valid /{total_rows} total")
+
+
+# load the payments data from the csv and send load data to load the data in the database 
+def process_payments(order_id_map):
+    print("Processing payments_raw.csv...")
+    df = pd.read_csv(SCRIPT_DIR / "payments_raw.csv")
+    total_rows = len(df)
+    valid_rows = []
+    seen_payments = set()
+    for _, row in df.iterrows():
+        # IMPORTANT:
+        # Raw payments CSV uses "id"
+        raw_payment_id = row["id"]
+        payment_key = (row["order_id"],row["amount"],row["method"],row.get("payment_date"))
+        if payment_key in seen_payments:
+            reject_row(row,"payments","duplicate payment row")
+
+            continue
+
         if pd.isna(row["amount"]):
-            rejected(row, "payments", f"amount missing or non-numeric (raw: '{row['amount']}')")
+
+            reject_row(row,"payments",f"amount missing or non-numeric (raw: '{row['amount']}')")
             continue
         amount = float(row["amount"])
         if amount <= 0:
-            rejected(row, "payments", "amount must be > 0 (CHECK constraint)")
+            reject_row(row,"payments","amount must be > 0 (CHECK constraint)")
             continue
- 
-        method = str(row["method"]).strip().lower()
+        method = (str(row["method"]).strip().lower())
         if method not in ALLOWED_PAYMENT_METHOD:
-            rejected(row, "payments", f"invalid payment method: '{method}'")
+            reject_row(row,"payments",f"invalid payment method: '{method}'")
             continue
- 
         raw_order_id = row["order_id"]
-        db_order_id = order_id_map.get(int(raw_order_id)) if pd.notna(raw_order_id) else None
-        if db_order_id is None:
-            rejected(row, "payments", f"order_id {raw_order_id} does not exist or was rejected (orphan FK)")
+        try:
+            database_order_id = (order_id_map.get(int(raw_order_id))
+                if pd.notna(raw_order_id)
+                else None
+            )
+        except (ValueError, TypeError):
+            reject_row(row,"payments",f"order_id not numeric:'{raw_order_id}'"
+            )
             continue
- 
-        seen.add(key)
+        if database_order_id is None:
+            reject_row(row,"payments",f"order_id {raw_order_id} does not exist or was rejected (orphan FK)")
+            continue
+
+        seen_payments.add(payment_key)
         row = row.copy()
         row["amount"] = amount
         row["method"] = method
-        row["order_id"] = db_order_id
+        row["order_id"] = (database_order_id)
+
         valid_rows.append(row)
- 
+
     clean = pd.DataFrame(valid_rows)
-    load_and_map(
-        clean, "payments", src_id_col="payment_id",
-        load_cols=["order_id", "amount", "payment_date", "method"],
+
+    load_data(clean,"payments",raw_id_column="id",
+        # PostgreSQL columns
+        columns=[
+            "order_id",
+            "amount",
+            "payment_date",
+            "method"
+        ]
     )
-    print(f"  payments: {len(clean)} valid / {before} total")
- 
- 
-# =================================================================
-# MAIN
-# =================================================================
+
+    print(f"  payments: {len(clean)} valid /{total_rows} total")
+
 if __name__ == "__main__":
-    customer_id_map = process_customers()
-    product_id_map = process_products()
-    order_id_map = process_orders(customer_id_map)
-    process_order_items(order_id_map, product_id_map)
-    process_payments(order_id_map)
- 
-    if rejected_rows:
-        pd.DataFrame(rejected_rows).to_csv("rejected_records.csv", index=False)
-        print(f"\n{len(rejected_rows)} rows rejected -> written to rejected_records.csv")
-    else:
-        print("\nNo rejected rows.")
- 
+    try:
+        customer_id_map = process_customers()
+        product_id_map = process_products()
+        order_id_map = process_orders(customer_id_map)
+        process_order_items(order_id_map,product_id_map)
+        process_payments(order_id_map)
+    finally:
+        if rejected_rows:
+            pd.DataFrame(rejected_rows).to_csv("rejected_records.csv",index=False)
+            print(f"\n{len(rejected_rows)} rows rejected -> written to rejected_records.csv" )
+        else:
+            print("\nNo rejected rows.")
     print("\nExtract & Load complete.")
- 
